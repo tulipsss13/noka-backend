@@ -3,6 +3,7 @@ uvicorn
 sqlalchemy
 python-jose
 bcrypt==4.0.1
+passlib
 python-multipart
 openai-whisper
 google-genai

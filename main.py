@@ -7,7 +7,7 @@ from security import hash_password, verify_password
 from auth import create_access_token, decode_access_token
 from fastapi.middleware.cors import CORSMiddleware
 
-import whisper
+from faster_whisper import WhisperModel
 from fastapi import UploadFile, File
 
 from google import genai
@@ -15,6 +15,8 @@ import os
 import shutil
 import json
 from dotenv import load_dotenv
+
+import time
 
 Base.metadata.create_all(bind=engine)
 
@@ -35,7 +37,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-model = whisper.load_model("base")
+model = WhisperModel(
+    "base",
+    device="cpu",
+    compute_type="int8"
+)
+
 load_dotenv()
 FFMPEG_PATH = r"C:\Users\zhara\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.2-full_build-shared\bin"
 
@@ -737,12 +744,13 @@ async def proses_suara(file: UploadFile = File(...)):
     with open("temp_audio.webm", "wb") as f:
         f.write(audio_data)
 
-    result = model.transcribe(
-        "temp_audio.webm",
-        language="id"
-    )
-
-    teks = result["text"]
+    waktu_mulai = time.perf_counter()
+    segments, info = model.transcribe(
+    "temp_audio.webm",
+    language="id",
+    beam_size=1
+)
+teks = "".join(segment.text for segment in segments).strip()
 
     prompt = f"""
 Kamu adalah sistem pencatat keuangan untuk UMKM.
@@ -765,10 +773,12 @@ Kalimat transaksi:
 {teks}
 """
 
+    waktu_mulai = time.perf_counter()
     response = client.models.generate_content(
         model="gemini-3.5-flash-lite",
         contents=prompt
     )
+    print(f"Waktu Gemini: {time.perf_counter() - waktu_mulai:.2f} detik")
 
     hasil = response.text.strip()
 

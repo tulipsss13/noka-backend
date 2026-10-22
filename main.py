@@ -1,27 +1,72 @@
-from fastapi import FastAPI, Depends
-from pydantic import BaseModel
+import os
+import json
+import time
+import tempfile
+from datetime import date, timedelta
+
+from fastapi import (
+    FastAPI,
+    Depends,
+    UploadFile,
+    File,
+    HTTPException,
+)
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
+from faster_whisper import WhisperModel
+from google import genai
+
 from database import engine, Base, SessionLocal
 import models
 from security import hash_password, verify_password
 from auth import create_access_token, decode_access_token
-from fastapi.middleware.cors import CORSMiddleware
 
-from faster_whisper import WhisperModel
-from fastapi import UploadFile, File
 
-from google import genai
-import os
-import shutil
-import json
-from dotenv import load_dotenv
+# =========================
+# KONFIGURASI AWAL
+# =========================
 
-import time
+load_dotenv()
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+app = FastAPI(title="NOKA Backend")
 security = HTTPBearer()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://noka-nota-kas.vercel.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+client = (
+    genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY
+    else None
+)
+
+# Model Whisper dimuat satu kali saat backend dijalankan.
+model = WhisperModel(
+    "base",
+    device="cpu",
+    compute_type="int8",
+)
+
+# Penyimpanan sementara untuk demo reset password.
+reset_verified_emails = set()
+
+
+# =========================
+# MODEL REQUEST
+# =========================
 
 class TransactionRequest(BaseModel):
     jenis: str
@@ -30,27 +75,151 @@ class TransactionRequest(BaseModel):
     keterangan: str
     tanggal: str
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-model = WhisperModel(
-    "base",
-    device="cpu",
-    compute_type="int8"
-)
 
-load_dotenv()
-FFMPEG_PATH = r"C:\Users\zhara\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.2-full_build-shared\bin"
+# =========================
+# FUNGSI BANTU
+# =========================
 
-os.environ["PATH"] += os.pathsep + FFMPEG_PATH
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
-reset_verified_emails = set()
+def get_user_id(credentials: HTTPAuthorizationCredentials) -> int:
+    """Memeriksa token dan mengambil ID pengguna."""
+    try:
+        data = decode_access_token(credentials.credentials)
+
+        if not data or "user_id" not in data:
+            raise HTTPException(
+                status_code=401,
+                detail="Token tidak valid.",
+            )
+
+        return data["user_id"]
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=401,
+            detail="Token tidak valid atau kedaluwarsa.",
+        )
+
+
+def proses_dengan_gemini(teks: str) -> dict:
+    """Mengubah teks suara menjadi data transaksi."""
+    if not client:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY belum dikonfigurasi.",
+        )
+
+    prompt = f"""
+Kamu adalah sistem pencatat keuangan UMKM.
+
+Ubah kalimat transaksi berikut menjadi JSON valid.
+
+Aturan:
+- jenis harus "pemasukan" atau "pengeluaran"
+- jumlah harus berupa bilangan bulat, tanpa simbol mata uang
+- kategori harus salah satu dari "Penjualan", "Bahan",
+  "Operasional", atau "Lainnya"
+- keterangan harus singkat dan jelas
+- jangan menebak jumlah jika tidak disebutkan;
+  jika jumlah tidak jelas, gunakan 0
+- jangan memberikan penjelasan atau markdown
+
+Format JSON:
+{{
+  "jenis": "pengeluaran",
+  "jumlah": 30000,
+  "kategori": "Bahan",
+  "keterangan": "beli beras"
+}}
+
+Kalimat pengguna:
+{teks}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=prompt,
+        )
+
+        if not response.text:
+            raise ValueError("Respons Gemini kosong.")
+
+        hasil = response.text.strip()
+        hasil = hasil.replace("```json", "").replace("```", "").strip()
+
+        data = json.loads(hasil)
+
+        jenis = str(data.get("jenis", "")).lower()
+        if jenis not in ("pemasukan", "pengeluaran"):
+            raise ValueError("Jenis transaksi tidak valid.")
+
+        jumlah = int(data.get("jumlah", 0))
+        if jumlah < 0:
+            raise ValueError("Jumlah transaksi tidak boleh negatif.")
+
+        kategori = str(data.get("kategori", "Lainnya"))
+        kategori_valid = [
+            "Penjualan",
+            "Bahan",
+            "Operasional",
+            "Lainnya",
+        ]
+
+        if kategori not in kategori_valid:
+            kategori = "Lainnya"
+
+        return {
+            "jenis": jenis,
+            "jumlah": jumlah,
+            "kategori": kategori,
+            "keterangan": str(data.get("keterangan", teks)),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Kesalahan Gemini: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail="Gagal memproses transaksi dengan Gemini.",
+        )
+
+
+def transkripsikan_audio(audio_path: str) -> str:
+    """Mengubah file audio menjadi teks bahasa Indonesia."""
+    try:
+        segments, info = model.transcribe(
+            audio_path,
+            language="id",
+            beam_size=1,
+        )
+
+        # segments bersifat generator, jadi harus dibaca.
+        teks = "".join(segment.text for segment in segments).strip()
+
+        if not teks:
+            raise HTTPException(
+                status_code=422,
+                detail="Suara tidak berhasil dikenali. Coba bicara lebih jelas.",
+            )
+
+        return teks
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Kesalahan Whisper: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Gagal mengubah audio menjadi teks.",
+        )
+
+
+# =========================
+# BERANDA
+# =========================
 
 @app.get("/")
 def home():
@@ -68,11 +237,23 @@ def register(nama: str, email: str, password: str):
     db = SessionLocal()
 
     try:
+        user_lama = (
+            db.query(models.User)
+            .filter(models.User.email == email)
+            .first()
+        )
+
+        if user_lama:
+            raise HTTPException(
+                status_code=400,
+                detail="Email sudah terdaftar.",
+            )
+
         user = models.User(
             nama=nama,
             email=email,
             password=hash_password(password),
-            terverifikasi=0
+            terverifikasi=0,
         )
 
         db.add(user)
@@ -82,7 +263,7 @@ def register(nama: str, email: str, password: str):
 
         otp = models.OTP(
             email=email,
-            kode=kode_otp
+            kode=kode_otp,
         )
 
         db.add(otp)
@@ -91,22 +272,25 @@ def register(nama: str, email: str, password: str):
         return {
             "message": "Registrasi berhasil! OTP telah dibuat.",
             "email": email,
-            "otp": kode_otp
+            "otp": kode_otp,
         }
 
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
-
-        return {
-            "error": str(e)
-        }
-
+        print(f"Kesalahan register: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Registrasi gagal.",
+        )
     finally:
         db.close()
 
 
 # =========================
-# VERIFY OTP
+# VERIFY OTP REGISTRASI
 # =========================
 
 @app.post("/verify-otp")
@@ -114,26 +298,33 @@ def verify_otp(email: str, kode: str):
     db = SessionLocal()
 
     try:
-        otp = db.query(models.OTP).filter(
-            models.OTP.email == email,
-            models.OTP.kode == kode
-        ).first()
+        otp = (
+            db.query(models.OTP)
+            .filter(
+                models.OTP.email == email,
+                models.OTP.kode == kode,
+            )
+            .first()
+        )
 
-        if otp:
-            user = db.query(models.User).filter(
-                models.User.email == email
-            ).first()
+        if not otp:
+            return {"message": "OTP salah!"}
 
-            if user:
-                user.terverifikasi = 1
-                db.commit()
+        user = (
+            db.query(models.User)
+            .filter(models.User.email == email)
+            .first()
+        )
 
-                return {
-                    "message": "OTP benar! Verifikasi berhasil."
-                }
+        if not user:
+            return {"message": "Email tidak ditemukan."}
+
+        user.terverifikasi = 1
+        db.delete(otp)
+        db.commit()
 
         return {
-            "message": "OTP salah!"
+            "message": "OTP benar! Verifikasi berhasil."
         }
 
     finally:
@@ -149,16 +340,13 @@ def login(email: str, password: str):
     db = SessionLocal()
 
     try:
-        user = db.query(models.User).filter(
-            models.User.email == email
-        ).first()
+        user = (
+            db.query(models.User)
+            .filter(models.User.email == email)
+            .first()
+        )
 
-        if not user:
-            return {
-                "message": "Email atau password salah."
-            }
-
-        if not verify_password(password, user.password):
+        if not user or not verify_password(password, user.password):
             return {
                 "message": "Email atau password salah."
             }
@@ -174,7 +362,7 @@ def login(email: str, password: str):
             "message": "Login berhasil!",
             "nama": user.nama,
             "email": user.email,
-            "access_token": token
+            "access_token": token,
         }
 
     finally:
@@ -188,13 +376,23 @@ def login(email: str, password: str):
 @app.post("/transaksi")
 def tambah_transaksi(
     body: TransactionRequest,
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
+    user_id = get_user_id(credentials)
     db = SessionLocal()
+
     try:
-        token = credentials.credentials
-        data = decode_access_token(token)
-        user_id = data["user_id"]
+        if body.jenis not in ("pemasukan", "pengeluaran"):
+            raise HTTPException(
+                status_code=400,
+                detail="Jenis transaksi tidak valid.",
+            )
+
+        if body.jumlah < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Jumlah tidak boleh negatif.",
+            )
 
         transaksi = models.Transaction(
             user_id=user_id,
@@ -202,7 +400,7 @@ def tambah_transaksi(
             jumlah=body.jumlah,
             kategori=body.kategori,
             keterangan=body.keterangan,
-            tanggal=body.tanggal
+            tanggal=body.tanggal,
         )
 
         db.add(transaksi)
@@ -211,276 +409,235 @@ def tambah_transaksi(
         return {
             "message": "Transaksi berhasil disimpan!"
         }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"Kesalahan tambah transaksi: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Gagal menyimpan transaksi.",
+        )
     finally:
         db.close()
+
 
 # =========================
 # LIHAT TRANSAKSI
 # =========================
+
 @app.get("/transaksi")
 def lihat_transaksi(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
+    user_id = get_user_id(credentials)
     db = SessionLocal()
+
     try:
-        token = credentials.credentials
-        data = decode_access_token(token)
-        user_id = data["user_id"]
+        transaksi = (
+            db.query(models.Transaction)
+            .filter(models.Transaction.user_id == user_id)
+            .all()
+        )
 
-        transaksi = db.query(models.Transaction).filter(
-            models.Transaction.user_id == user_id
-        ).all()
-
-        hasil = []
-
-        for item in transaksi:
-            hasil.append({
+        return [
+            {
                 "id": item.id,
                 "jenis": item.jenis,
                 "jumlah": item.jumlah,
                 "kategori": item.kategori,
                 "keterangan": item.keterangan,
-                "tanggal": item.tanggal
-            })
-
-        return hasil
+                "tanggal": item.tanggal,
+            }
+            for item in transaksi
+        ]
 
     finally:
         db.close()
 
+
 # =========================
 # LIHAT SALDO
 # =========================
+
 @app.get("/saldo")
 def lihat_saldo(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
+    user_id = get_user_id(credentials)
     db = SessionLocal()
+
     try:
-        token = credentials.credentials
-        data = decode_access_token(token)
-        user_id = data["user_id"]
+        transaksi = (
+            db.query(models.Transaction)
+            .filter(models.Transaction.user_id == user_id)
+            .all()
+        )
 
-        transaksi = db.query(models.Transaction).filter(
-            models.Transaction.user_id == user_id
-        ).all()
+        total_pemasukan = sum(
+            item.jumlah
+            for item in transaksi
+            if item.jenis == "pemasukan"
+        )
 
-        total_pemasukan = 0
-        total_pengeluaran = 0
-
-        for item in transaksi:
-            if item.jenis == "pemasukan":
-                total_pemasukan += item.jumlah
-            elif item.jenis == "pengeluaran":
-                total_pengeluaran += item.jumlah
-
-        saldo = total_pemasukan - total_pengeluaran
+        total_pengeluaran = sum(
+            item.jumlah
+            for item in transaksi
+            if item.jenis == "pengeluaran"
+        )
 
         return {
             "total_pemasukan": total_pemasukan,
             "total_pengeluaran": total_pengeluaran,
-            "saldo": saldo
+            "saldo": total_pemasukan - total_pengeluaran,
         }
 
     finally:
         db.close()
 
+
 # =========================
 # DASHBOARD
 # =========================
+
 @app.get("/dashboard")
 def dashboard(
     filter: str = "harian",
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
+    user_id = get_user_id(credentials)
     db = SessionLocal()
-    try:
-        # =========================
-        # CEK TOKEN
-        # =========================
-        token = credentials.credentials
-        data = decode_access_token(token)
-        user_id = data["user_id"]
 
-        # =========================
-        # AMBIL DATA USER
-        # =========================
-        user = db.query(models.User).filter(
-            models.User.id == user_id
-        ).first()
+    try:
+        user = (
+            db.query(models.User)
+            .filter(models.User.id == user_id)
+            .first()
+        )
 
         if not user:
-            return {
-                "error": "User tidak ditemukan."
-            }
+            raise HTTPException(
+                status_code=404,
+                detail="User tidak ditemukan.",
+            )
 
-        # =========================
-        # AMBIL SEMUA TRANSAKSI USER
-        # =========================
-        semua_transaksi = db.query(models.Transaction).filter(
-            models.Transaction.user_id == user_id
-        ).all()
-
-        # =========================
-        # TANGGAL
-        # =========================
-        from datetime import date, timedelta
+        semua_transaksi = (
+            db.query(models.Transaction)
+            .filter(models.Transaction.user_id == user_id)
+            .all()
+        )
 
         hari_ini = date.today()
         tanggal_hari_ini = hari_ini.isoformat()
 
-        # =========================
-        # FILTER DATA
-        # =========================
-        transaksi = []
-
         if filter == "harian":
-
-            for item in semua_transaksi:
-                if item.tanggal == tanggal_hari_ini:
-                    transaksi.append(item)
+            transaksi = [
+                item for item in semua_transaksi
+                if item.tanggal == tanggal_hari_ini
+            ]
 
         elif filter == "mingguan":
-
             awal_minggu = hari_ini - timedelta(
                 days=hari_ini.weekday()
             )
 
+            transaksi = []
+
             for item in semua_transaksi:
                 try:
-                    tanggal_transaksi = date.fromisoformat(
-                        item.tanggal
-                    )
+                    tanggal_transaksi = date.fromisoformat(item.tanggal)
 
-                    if (
-                        awal_minggu
-                        <= tanggal_transaksi
-                        <= hari_ini
-                    ):
+                    if awal_minggu <= tanggal_transaksi <= hari_ini:
                         transaksi.append(item)
-
-                except:
-                    pass
+                except (ValueError, TypeError):
+                    continue
 
         elif filter == "bulanan":
+            transaksi = []
 
             for item in semua_transaksi:
                 try:
-                    tanggal_transaksi = date.fromisoformat(
-                        item.tanggal
-                    )
+                    tanggal_transaksi = date.fromisoformat(item.tanggal)
 
                     if (
                         tanggal_transaksi.year == hari_ini.year
                         and tanggal_transaksi.month == hari_ini.month
                     ):
                         transaksi.append(item)
-
-                except:
-                    pass
+                except (ValueError, TypeError):
+                    continue
 
         else:
-            return {
-                "error": "Filter harus harian, mingguan, atau bulanan."
-            }
+            raise HTTPException(
+                status_code=400,
+                detail="Filter harus harian, mingguan, atau bulanan.",
+            )
 
-        # =========================
-        # TOTAL PEMASUKAN
-        # SESUAI FILTER
-        # =========================
-        total_pemasukan = 0
-
-        for item in transaksi:
-            if item.jenis == "pemasukan":
-                total_pemasukan += item.jumlah
-
-        # =========================
-        # TOTAL PENGELUARAN
-        # SESUAI FILTER
-        # =========================
-        total_pengeluaran = 0
-
-        for item in transaksi:
-            if item.jenis == "pengeluaran":
-                total_pengeluaran += item.jumlah
-
-        # =========================
-        # SALDO KESELURUHAN
-        # TIDAK TERPENGARUH FILTER
-        # =========================
-        total_semua_pemasukan = 0
-        total_semua_pengeluaran = 0
-
-        for item in semua_transaksi:
-
-            if item.jenis == "pemasukan":
-                total_semua_pemasukan += item.jumlah
-
-            elif item.jenis == "pengeluaran":
-                total_semua_pengeluaran += item.jumlah
-
-        saldo = (
-            total_semua_pemasukan
-            - total_semua_pengeluaran
+        total_pemasukan = sum(
+            item.jumlah for item in transaksi
+            if item.jenis == "pemasukan"
         )
 
-        # =========================
-        # PEMASUKAN HARI INI
-        # =========================
-        pemasukan_hari_ini = 0
+        total_pengeluaran = sum(
+            item.jumlah for item in transaksi
+            if item.jenis == "pengeluaran"
+        )
 
-        # =========================
-        # PENGELUARAN HARI INI
-        # =========================
-        pengeluaran_hari_ini = 0
+        total_semua_pemasukan = sum(
+            item.jumlah for item in semua_transaksi
+            if item.jenis == "pemasukan"
+        )
 
-        for item in semua_transaksi:
+        total_semua_pengeluaran = sum(
+            item.jumlah for item in semua_transaksi
+            if item.jenis == "pengeluaran"
+        )
 
-            if item.tanggal == tanggal_hari_ini:
+        saldo = total_semua_pemasukan - total_semua_pengeluaran
 
-                if item.jenis == "pemasukan":
-                    pemasukan_hari_ini += item.jumlah
+        pemasukan_hari_ini = sum(
+            item.jumlah for item in semua_transaksi
+            if (
+                item.tanggal == tanggal_hari_ini
+                and item.jenis == "pemasukan"
+            )
+        )
 
-                elif item.jenis == "pengeluaran":
-                    pengeluaran_hari_ini += item.jumlah
+        pengeluaran_hari_ini = sum(
+            item.jumlah for item in semua_transaksi
+            if (
+                item.tanggal == tanggal_hari_ini
+                and item.jenis == "pengeluaran"
+            )
+        )
 
-        # =========================
-        # DATA GRAFIK
-        # SESUAI FILTER
-        # =========================
         data_grafik = {}
 
         for item in transaksi:
-
             tanggal = item.tanggal
 
             if tanggal not in data_grafik:
                 data_grafik[tanggal] = {
                     "tanggal": tanggal,
                     "pemasukan": 0,
-                    "pengeluaran": 0
+                    "pengeluaran": 0,
                 }
 
             if item.jenis == "pemasukan":
                 data_grafik[tanggal]["pemasukan"] += item.jumlah
-
             elif item.jenis == "pengeluaran":
                 data_grafik[tanggal]["pengeluaran"] += item.jumlah
 
-        grafik = list(data_grafik.values())
-
-        grafik.sort(
-            key=lambda x: x["tanggal"]
+        grafik = sorted(
+            data_grafik.values(),
+            key=lambda item: item["tanggal"],
         )
 
-        # =========================
-        # DATA BERDASARKAN KATEGORI
-        # SESUAI FILTER
-        # =========================
         data_kategori = {}
 
         for item in transaksi:
-
             kategori = item.kategori
 
             if kategori not in data_kategori:
@@ -488,48 +645,28 @@ def dashboard(
 
             data_kategori[kategori] += item.jumlah
 
-        # =========================
-        # UBAH DATA KATEGORI
-        # MENJADI LIST
-        # =========================
-        kategori_list = []
+        kategori_list = [
+            {"kategori": kategori, "jumlah": jumlah}
+            for kategori, jumlah in data_kategori.items()
+        ]
 
-        for kategori, jumlah in data_kategori.items():
-
-            kategori_list.append({
-                "kategori": kategori,
-                "jumlah": jumlah
-            })
-
-        # =========================
-        # URUTKAN KATEGORI
-        # DARI JUMLAH TERBESAR
-        # =========================
         kategori_list.sort(
-            key=lambda x: x["jumlah"],
-            reverse=True
+            key=lambda item: item["jumlah"],
+            reverse=True,
         )
 
-        # =========================
-        # RIWAYAT TRANSAKSI
-        # SESUAI FILTER
-        # =========================
-        riwayat = []
-
-        for item in transaksi:
-
-            riwayat.append({
+        riwayat = [
+            {
                 "id": item.id,
                 "jenis": item.jenis,
                 "jumlah": item.jumlah,
                 "kategori": item.kategori,
                 "keterangan": item.keterangan,
-                "tanggal": item.tanggal
-            })
+                "tanggal": item.tanggal,
+            }
+            for item in transaksi
+        ]
 
-        # =========================
-        # RESPONSE DASHBOARD
-        # =========================
         return {
             "nama": user.nama,
             "filter": filter,
@@ -540,16 +677,12 @@ def dashboard(
             "pengeluaran_hari_ini": pengeluaran_hari_ini,
             "data_grafik": grafik,
             "data_kategori": kategori_list,
-            "riwayat_transaksi": riwayat
-        }
-
-    except Exception as e:
-        return {
-            "error": str(e)
+            "riwayat_transaksi": riwayat,
         }
 
     finally:
         db.close()
+
 
 # =========================
 # FORGOT PASSWORD
@@ -560,20 +693,20 @@ def forgot_password(email: str):
     db = SessionLocal()
 
     try:
-        user = db.query(models.User).filter(
-            models.User.email == email
-        ).first()
+        user = (
+            db.query(models.User)
+            .filter(models.User.email == email)
+            .first()
+        )
 
         if not user:
-            return {
-                "message": "Email tidak ditemukan."
-            }
+            return {"message": "Email tidak ditemukan."}
 
         kode_otp = "1234"
 
         otp = models.OTP(
             email=email,
-            kode=kode_otp
+            kode=kode_otp,
         )
 
         db.add(otp)
@@ -582,11 +715,12 @@ def forgot_password(email: str):
         return {
             "message": "OTP reset password berhasil dibuat.",
             "email": email,
-            "otp": kode_otp
+            "otp": kode_otp,
         }
 
     finally:
         db.close()
+
 
 # =========================
 # VERIFY OTP RESET PASSWORD
@@ -597,10 +731,14 @@ def verify_reset_otp(email: str, kode: str):
     db = SessionLocal()
 
     try:
-        otp = db.query(models.OTP).filter(
-            models.OTP.email == email,
-            models.OTP.kode == kode
-        ).first()
+        otp = (
+            db.query(models.OTP)
+            .filter(
+                models.OTP.email == email,
+                models.OTP.kode == kode,
+            )
+            .first()
+        )
 
         if otp:
             reset_verified_emails.add(email)
@@ -609,12 +747,11 @@ def verify_reset_otp(email: str, kode: str):
                 "message": "OTP benar! Silakan buat kata sandi baru."
             }
 
-        return {
-            "message": "OTP salah!"
-        }
+        return {"message": "OTP salah!"}
 
     finally:
         db.close()
+
 
 # =========================
 # RESET PASSWORD
@@ -624,49 +761,38 @@ def verify_reset_otp(email: str, kode: str):
 def reset_password(
     email: str,
     password_baru: str,
-    konfirmasi_password: str
+    konfirmasi_password: str,
 ):
     db = SessionLocal()
 
     try:
-        # Cek apakah OTP reset sudah diverifikasi
         if email not in reset_verified_emails:
             return {
                 "message": "Silakan verifikasi OTP terlebih dahulu."
             }
 
-        # Cek apakah email terdaftar
-        user = db.query(models.User).filter(
-            models.User.email == email
-        ).first()
+        user = (
+            db.query(models.User)
+            .filter(models.User.email == email)
+            .first()
+        )
 
         if not user:
-            return {
-                "message": "Email tidak ditemukan."
-            }
+            return {"message": "Email tidak ditemukan."}
 
-        # Cek password baru dan konfirmasi
         if password_baru != konfirmasi_password:
-            return {
-                "message": "Password tidak sama."
-            }
+            return {"message": "Password tidak sama."}
 
-        # Ubah password
-        hashed_password = hash_password(password_baru)
-
-        user.password = hashed_password
-
+        user.password = hash_password(password_baru)
         db.commit()
 
-        # Hapus status verifikasi setelah password berhasil diubah
-        reset_verified_emails.remove(email)
+        reset_verified_emails.discard(email)
 
-        return {
-            "message": "Password berhasil diubah."
-        }
+        return {"message": "Password berhasil diubah."}
 
     finally:
         db.close()
+
 
 # =========================
 # SPEECH TO TEXT
@@ -674,63 +800,36 @@ def reset_password(
 
 @app.post("/speech-to-text")
 async def speech_to_text(file: UploadFile = File(...)):
-    audio_data = await file.read()
+    suffix = os.path.splitext(file.filename or "")[1] or ".webm"
+    audio_path = None
 
-    with open("temp_audio", "wb") as f:
-        f.write(audio_data)
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+        ) as temp_file:
+            audio_path = temp_file.name
+            temp_file.write(await file.read())
 
-    result = model.transcribe("temp_audio", language="id")
+        teks = transkripsikan_audio(audio_path)
 
-    return {
-        "text": result["text"]
-    }
+        return {"text": teks}
+
+    finally:
+        await file.close()
+
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+
 
 # =========================
 # TEST GEMINI
 # =========================
+
 @app.post("/test-gemini")
 def test_gemini(text: str):
+    return proses_dengan_gemini(text)
 
-    prompt = f"""
-Kamu adalah sistem pencatat keuangan UMKM.
-
-Tugas kamu adalah mengubah kalimat transaksi pengguna menjadi data transaksi.
-
-Tentukan:
-- jenis: "pemasukan" atau "pengeluaran"
-- jumlah: angka saja
-- kategori: kategori transaksi
-- keterangan: penjelasan singkat transaksi
-
-Jangan bertanya balik.
-Jangan memberikan penjelasan tambahan.
-Hanya berikan JSON valid tanpa markdown dan tanpa ```.
-
-Contoh:
-{{
-  "jenis": "pengeluaran",
-  "jumlah": 30000,
-  "kategori": "Bahan",
-  "keterangan": "beli beras"
-}}
-
-Kalimat pengguna:
-{text}
-"""
-
-    response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=prompt
-    )
-
-    hasil = response.text.strip()
-
-    # Menghapus ```json dan ``` jika Gemini masih memberikannya
-    hasil = hasil.replace("```json", "").replace("```", "").strip()
-
-    data = json.loads(hasil)
-
-    return data
 
 # =========================
 # PROSES SUARA
@@ -738,55 +837,47 @@ Kalimat pengguna:
 
 @app.post("/proses-suara")
 async def proses_suara(file: UploadFile = File(...)):
-
-    audio_data = await file.read()
-
-    with open("temp_audio.webm", "wb") as f:
-        f.write(audio_data)
-
     waktu_mulai = time.perf_counter()
-    segments, info = model.transcribe(
-    "temp_audio.webm",
-    language="id",
-    beam_size=1
-)
-teks = "".join(segment.text for segment in segments).strip()
+    suffix = os.path.splitext(file.filename or "")[1] or ".webm"
+    audio_path = None
 
-    prompt = f"""
-Kamu adalah sistem pencatat keuangan untuk UMKM.
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+        ) as temp_file:
+            audio_path = temp_file.name
+            temp_file.write(await file.read())
 
-Ubah kalimat transaksi berikut menjadi JSON.
+        waktu_whisper = time.perf_counter()
+        teks = transkripsikan_audio(audio_path)
 
-Tentukan:
-- jenis: "pemasukan" atau "pengeluaran"
-- jumlah: angka saja
-- kategori: pilih salah satu dari:
-  "Penjualan", "Bahan", "Operasional", "Lainnya"
-- keterangan: penjelasan singkat transaksi
+        print(
+            f"Waktu Whisper: "
+            f"{time.perf_counter() - waktu_whisper:.2f} detik"
+        )
 
-Jangan bertanya kepada pengguna.
-Jangan memberikan penjelasan tambahan.
-Jangan menggunakan markdown.
-Hanya berikan JSON yang valid.
+        waktu_gemini = time.perf_counter()
+        data = proses_dengan_gemini(teks)
 
-Kalimat transaksi:
-{teks}
-"""
+        print(
+            f"Waktu Gemini: "
+            f"{time.perf_counter() - waktu_gemini:.2f} detik"
+        )
 
-    waktu_mulai = time.perf_counter()
-    response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=prompt
-    )
-    print(f"Waktu Gemini: {time.perf_counter() - waktu_mulai:.2f} detik")
+        print(
+            f"Total waktu proses suara: "
+            f"{time.perf_counter() - waktu_mulai:.2f} detik"
+        )
 
-    hasil = response.text.strip()
+        return {
+            "teks": teks,
+            "transaksi": data,
+        }
 
-    hasil = hasil.replace("```json", "").replace("```", "").strip()
+    finally:
+        await file.close()
 
-    data = json.loads(hasil)
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
 
-    return {
-        "teks": teks,
-        "transaksi": data
-    }
